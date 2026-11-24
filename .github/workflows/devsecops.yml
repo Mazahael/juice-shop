@@ -2,6 +2,17 @@
 #  DevSecOps-пайплайн для OWASP Juice Shop
 #  Дипломная работа «Специалист по ИБ», трек DevSecOps (Нетология)
 #
+#  Этапы:
+#   1. Secrets  — Gitleaks: поиск секретов в репозитории
+#   2. SAST     — Semgrep + CodeQL: анализ кода JS/TS
+#   3. SCA      — Trivy fs: уязвимые зависимости npm
+#   4. Config   — Hadolint + Trivy config: Dockerfile и конфигурация
+#   5. Build    — сборка Docker-образа и публикация в GHCR
+#   6. Image    — Trivy image: уязвимости в собранном образе
+#   7. DAST     — OWASP ZAP: baseline, full scan, API scan
+#   8. Gate     — Security Gate: пороги, отчёт, комментарий в PR
+#   9. Deploy   — доставка на VPS по SSH (только ветка master)
+# ─────────────────────────────────────────────────────────────
 name: DevSecOps Pipeline
 
 on:
@@ -52,7 +63,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: gitleaks
+          name: report-gitleaks
           path: out/gitleaks.sarif
 
   # ─────────────── 2a. SAST: Semgrep ───────────────
@@ -87,7 +98,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: semgrep
+          name: report-semgrep
           path: out/semgrep.sarif
 
   # ─────────────── 2b. SAST: CodeQL ───────────────
@@ -156,7 +167,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: trivy-fs
+          name: report-trivy-fs
           path: out/trivy-fs.json
 
   # ─────────────── 4. Проверка конфигурации ───────────────
@@ -200,7 +211,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: config
+          name: report-config
           path: |
             out/trivy-config.json
             out/hadolint.sarif
@@ -274,7 +285,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: trivy-image
+          name: report-trivy-image
           path: out/trivy-image.json
 
   # ─────────────── 7. DAST: OWASP ZAP ───────────────
@@ -340,7 +351,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: zap
+          name: report-zap
           path: |
             zap/*.json
             zap/*.html
@@ -366,8 +377,11 @@ jobs:
       MAX_DAST_HIGH: ${{ vars.MAX_DAST_HIGH || '0' }}
       NEEDS_JSON: ${{ toJSON(needs) }}
     steps:
+      # Скачиваем только отчёты сканеров (имена report-*),
+      # служебные артефакты других шагов не трогаем
       - uses: actions/download-artifact@v4
         with:
+          pattern: report-*
           path: reports
 
       - name: Evaluate results
@@ -386,12 +400,12 @@ jobs:
             jq -s "$filter" "$@"
           }
 
-          SECRETS=$(count '[.[].runs[]?.results[]?] | length' "$R/gitleaks/gitleaks.sarif")
-          SAST=$(count '[.[].runs[]?.results[]? | select(.level=="error")] | length' "$R/semgrep/semgrep.sarif")
-          SCA=$(count '[.[].Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$R/trivy-fs/trivy-fs.json")
-          IMG=$(count '[.[].Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$R/trivy-image/trivy-image.json")
-          MISCONF=$(count '[.[].Results[]?.Misconfigurations[]? | select(.Severity=="HIGH" or .Severity=="CRITICAL")] | length' "$R/config/trivy-config.json")
-          ZAP_FILES=$(ls "$R"/zap/zap-*.json 2>/dev/null)
+          SECRETS=$(count '[.[].runs[]?.results[]?] | length' "$R/report-gitleaks/gitleaks.sarif")
+          SAST=$(count '[.[].runs[]?.results[]? | select(.level=="error")] | length' "$R/report-semgrep/semgrep.sarif")
+          SCA=$(count '[.[].Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$R/report-trivy-fs/trivy-fs.json")
+          IMG=$(count '[.[].Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$R/report-trivy-image/trivy-image.json")
+          MISCONF=$(count '[.[].Results[]?.Misconfigurations[]? | select(.Severity=="HIGH" or .Severity=="CRITICAL")] | length' "$R/report-config/trivy-config.json")
+          ZAP_FILES=$(ls "$R"/report-zap/zap-*.json 2>/dev/null)
           if [ -n "$ZAP_FILES" ]; then
             DAST=$(jq -s '[.[] | .site[]?.alerts[]? | select(.riskcode=="3") | .name] | unique | length' $ZAP_FILES)
           else
@@ -442,7 +456,7 @@ jobs:
           } > report.md
 
           # Секреты
-          F="$R/gitleaks/gitleaks.sarif"
+          F="$R/report-gitleaks/gitleaks.sarif"
           ROWS=""
           [ -f "$F" ] && ROWS=$(jq -r '.runs[]?.results[]? | "| \(.ruleId) | `\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)` |"' "$F" | head -n 15)
           if [ -n "$ROWS" ]; then
@@ -458,7 +472,7 @@ jobs:
           fi
 
           # SAST
-          F="$R/semgrep/semgrep.sarif"
+          F="$R/report-semgrep/semgrep.sarif"
           ROWS=""
           [ -f "$F" ] && ROWS=$(jq -r '.runs[]?.results[]? | select(.level=="error") | "| `\(.ruleId | split(".") | last)` | `\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)` | \(.message.text | gsub("[\\r\\n|]"; " ") | .[0:160]) |"' "$F" | head -n 15)
           if [ -n "$ROWS" ]; then
@@ -475,7 +489,7 @@ jobs:
 
           # Зависимости и образ
           DEP_FILES=""
-          for f in "$R/trivy-fs/trivy-fs.json" "$R/trivy-image/trivy-image.json"; do
+          for f in "$R/report-trivy-fs/trivy-fs.json" "$R/report-trivy-image/trivy-image.json"; do
             [ -f "$f" ] && DEP_FILES="$DEP_FILES $f"
           done
           ROWS=""
@@ -493,7 +507,7 @@ jobs:
           fi
 
           # Конфигурация
-          F="$R/config/trivy-config.json"
+          F="$R/report-config/trivy-config.json"
           ROWS=""
           [ -f "$F" ] && ROWS=$(jq -r '.Results[]? | .Target as $t | .Misconfigurations[]? | select(.Severity=="HIGH" or .Severity=="CRITICAL") | "| \(.Severity) | `\($t)` | \(.Title) | \((.Resolution // "") | gsub("[\\r\\n|]"; " ")) |"' "$F" | head -n 15)
           if [ -n "$ROWS" ]; then
@@ -542,7 +556,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: security-report
+          name: security-gate-report
           path: report.md
 
       - name: Block release
