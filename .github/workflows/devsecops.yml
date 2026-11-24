@@ -1,0 +1,605 @@
+# ─────────────────────────────────────────────────────────────
+#  DevSecOps-пайплайн для OWASP Juice Shop
+#  Дипломная работа «Специалист по ИБ», трек DevSecOps (Нетология)
+#
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: devsecops-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Имя образа в GHCR должно быть в нижнем регистре
+  IMAGE_NAME: ghcr.io/mazahael/juice-shop
+  TRIVY_IMAGE: aquasec/trivy:latest
+
+jobs:
+  # ─────────────── 1. Поиск секретов ───────────────
+  secrets:
+    name: "1. Secrets: Gitleaks"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Gitleaks scan
+        run: |
+          mkdir -p out && chmod 777 out
+          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:latest \
+            detect --source . --no-git --redact --no-banner \
+            --report-format sarif --report-path out/gitleaks.sarif --exit-code 0
+
+      - name: Upload to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: out/gitleaks.sarif
+          category: gitleaks
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks
+          path: out/gitleaks.sarif
+
+  # ─────────────── 2a. SAST: Semgrep ───────────────
+  sast-semgrep:
+    name: "2. SAST: Semgrep"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Semgrep scan
+        run: |
+          mkdir -p out && chmod 777 out
+          docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep:latest \
+            semgrep scan --metrics=off \
+              --config p/javascript \
+              --config p/typescript \
+              --config p/nodejsscan \
+              --config p/owasp-top-ten \
+              --sarif --output out/semgrep.sarif || true
+
+      - name: Upload to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: out/semgrep.sarif
+          category: semgrep
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep
+          path: out/semgrep.sarif
+
+  # ─────────────── 2b. SAST: CodeQL ───────────────
+  sast-codeql:
+    name: "2. SAST: CodeQL"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          queries: security-extended
+
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: codeql
+
+  # ─────────────── 3. SCA: зависимости ───────────────
+  sca:
+    name: "3. SCA: Trivy (dependencies)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Juice Shop не хранит package-lock.json в репозитории,
+      # поэтому генерируем lock-файлы, чтобы Trivy увидел точные версии
+      - name: Generate lock files
+        run: |
+          npm install --package-lock-only --package-lock=true --ignore-scripts \
+            --legacy-peer-deps --no-audit --no-fund \
+            || echo "::warning::Не удалось создать package-lock.json (backend)"
+          (cd frontend && npm install --package-lock-only --package-lock=true --ignore-scripts \
+            --legacy-peer-deps --no-audit --no-fund) \
+            || echo "::warning::Не удалось создать package-lock.json (frontend)"
+
+      - name: Trivy filesystem scan
+        run: |
+          mkdir -p out && chmod 777 out
+          docker run --rm -v "$PWD:/src" -v "$HOME/.cache/trivy:/root/.cache/trivy" "$TRIVY_IMAGE" \
+            fs --scanners vuln --format json --output /src/out/trivy-fs.json /src
+          docker run --rm -v "$PWD:/src" "$TRIVY_IMAGE" \
+            convert --format sarif --output /src/out/trivy-fs.sarif /src/out/trivy-fs.json
+
+      - name: Upload to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: out/trivy-fs.sarif
+          category: trivy-fs
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-fs
+          path: out/trivy-fs.json
+
+  # ─────────────── 4. Проверка конфигурации ───────────────
+  config:
+    name: "4. Config: Hadolint + Trivy config"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Hadolint (Dockerfile)
+        run: |
+          mkdir -p out && chmod 777 out
+          docker run --rm -v "$PWD:/src" -w /src hadolint/hadolint:latest \
+            hadolint -f sarif Dockerfile > out/hadolint.sarif || true
+
+      - name: Trivy misconfiguration scan
+        run: |
+          docker run --rm -v "$PWD:/src" -v "$HOME/.cache/trivy:/root/.cache/trivy" "$TRIVY_IMAGE" \
+            config --format json --output /src/out/trivy-config.json /src
+          docker run --rm -v "$PWD:/src" "$TRIVY_IMAGE" \
+            convert --format sarif --output /src/out/trivy-config.sarif /src/out/trivy-config.json
+
+      - name: Upload Hadolint to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: out/hadolint.sarif
+          category: hadolint
+
+      - name: Upload Trivy config to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: out/trivy-config.sarif
+          category: trivy-config
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: config
+          path: |
+            out/trivy-config.json
+            out/hadolint.sarif
+
+  # ─────────────── 5. Сборка образа ───────────────
+  build:
+    name: "5. Build & push image"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────── 6. Сканирование образа ───────────────
+  image-scan:
+    name: "6. Image: Trivy"
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trivy image scan
+        run: |
+          mkdir -p out && chmod 777 out
+          docker pull "$IMAGE_NAME:$GITHUB_SHA"
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD:/src" -v "$HOME/.cache/trivy:/root/.cache/trivy" "$TRIVY_IMAGE" \
+            image --scanners vuln --format json --output /src/out/trivy-image.json "$IMAGE_NAME:$GITHUB_SHA"
+          docker run --rm -v "$PWD:/src" "$TRIVY_IMAGE" \
+            convert --format sarif --output /src/out/trivy-image.sarif /src/out/trivy-image.json
+
+      - name: Upload to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: out/trivy-image.sarif
+          category: trivy-image
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-image
+          path: out/trivy-image.json
+
+  # ─────────────── 7. DAST: OWASP ZAP ───────────────
+  dast:
+    name: "7. DAST: OWASP ZAP"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+    # Временный запуск только что собранного образа прямо в раннере
+    services:
+      juice:
+        image: ghcr.io/mazahael/juice-shop:${{ github.sha }}
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        ports:
+          - 3000:3000
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Wait for Juice Shop
+        run: |
+          for i in $(seq 1 40); do
+            if curl -sf http://localhost:3000 > /dev/null; then
+              echo "Juice Shop запущен"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Juice Shop не запустился"; exit 1
+
+      - name: Prepare ZAP workdir
+        run: |
+          mkdir -p zap
+          [ -f swagger.yml ] && cp swagger.yml zap/
+          chmod -R 777 zap
+
+      - name: "ZAP Baseline scan (пассивный)"
+        run: |
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://localhost:3000 -m 2 -I \
+            -J zap-baseline.json -r zap-baseline.html -w zap-baseline.md || true
+
+      - name: "ZAP Full scan (активный)"
+        run: |
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py -t http://localhost:3000 -m 3 -I \
+            -J zap-full.json -r zap-full.html -w zap-full.md \
+            -z "-config scanner.maxScanDurationInMins=15 -config scanner.maxRuleDurationInMins=2" || true
+
+      - name: "ZAP API scan (OpenAPI)"
+        run: |
+          if [ -f zap/swagger.yml ]; then
+            docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+              zap-api-scan.py -t /zap/wrk/swagger.yml -f openapi -O http://localhost:3000 -I \
+              -J zap-api.json -r zap-api.html -w zap-api.md || true
+          else
+            echo "::warning::swagger.yml не найден, API-скан пропущен"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap
+          path: |
+            zap/*.json
+            zap/*.html
+            zap/*.md
+
+  # ─────────────── 8. Security Gate ───────────────
+  security-gate:
+    name: "8. Security Gate"
+    needs: [secrets, sast-semgrep, sast-codeql, sca, config, image-scan, dast]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      # Пороги задаются переменными репозитория (Settings → Variables).
+      # По умолчанию 0 — любая серьёзная находка останавливает релиз.
+      MAX_SECRETS: ${{ vars.MAX_SECRETS || '0' }}
+      MAX_SAST_HIGH: ${{ vars.MAX_SAST_HIGH || '0' }}
+      MAX_SCA_CRITICAL: ${{ vars.MAX_SCA_CRITICAL || '0' }}
+      MAX_IMAGE_CRITICAL: ${{ vars.MAX_IMAGE_CRITICAL || '0' }}
+      MAX_MISCONFIG: ${{ vars.MAX_MISCONFIG || '0' }}
+      MAX_DAST_HIGH: ${{ vars.MAX_DAST_HIGH || '0' }}
+      NEEDS_JSON: ${{ toJSON(needs) }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: reports
+
+      - name: Evaluate results
+        id: gate
+        run: |
+          set +e
+          R=reports
+          BLOCKED=false
+
+          # Подсчёт находок: $1 — jq-фильтр, далее — файлы отчётов
+          count() {
+            local filter="$1"; shift
+            for f in "$@"; do
+              [ -f "$f" ] || { echo "MISSING"; return; }
+            done
+            jq -s "$filter" "$@"
+          }
+
+          SECRETS=$(count '[.[].runs[]?.results[]?] | length' "$R/gitleaks/gitleaks.sarif")
+          SAST=$(count '[.[].runs[]?.results[]? | select(.level=="error")] | length' "$R/semgrep/semgrep.sarif")
+          SCA=$(count '[.[].Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$R/trivy-fs/trivy-fs.json")
+          IMG=$(count '[.[].Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$R/trivy-image/trivy-image.json")
+          MISCONF=$(count '[.[].Results[]?.Misconfigurations[]? | select(.Severity=="HIGH" or .Severity=="CRITICAL")] | length' "$R/config/trivy-config.json")
+          ZAP_FILES=$(ls "$R"/zap/zap-*.json 2>/dev/null)
+          if [ -n "$ZAP_FILES" ]; then
+            DAST=$(jq -s '[.[] | .site[]?.alerts[]? | select(.riskcode=="3") | .name] | unique | length' $ZAP_FILES)
+          else
+            DAST=MISSING
+          fi
+
+          : > rows.md
+          row() {
+            local name="$1" val="$2" max="$3" status
+            if [ "$val" = "MISSING" ]; then status="❌ скан не выполнен"; BLOCKED=true
+            elif [ "$val" -gt "$max" ]; then status="❌ превышен порог"; BLOCKED=true
+            else status="✅ в пределах порога"; fi
+            echo "| $name | $val | $max | $status |" >> rows.md
+          }
+          row "Секреты — Gitleaks" "$SECRETS" "$MAX_SECRETS"
+          row "Код, уровень ERROR — Semgrep" "$SAST" "$MAX_SAST_HIGH"
+          row "Зависимости, CRITICAL — Trivy fs" "$SCA" "$MAX_SCA_CRITICAL"
+          row "Образ, CRITICAL — Trivy image" "$IMG" "$MAX_IMAGE_CRITICAL"
+          row "Конфигурация, HIGH+ — Trivy config" "$MISCONF" "$MAX_MISCONFIG"
+          row "DAST, High — OWASP ZAP" "$DAST" "$MAX_DAST_HIGH"
+
+          FAILED_JOBS=$(echo "$NEEDS_JSON" | jq -r 'to_entries[] | select(.value.result != "success") | .key' | paste -sd ',' -)
+          if [ -n "$FAILED_JOBS" ]; then BLOCKED=true; fi
+
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          SEC_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/security/code-scanning"
+
+          {
+            echo "## 🛡️ Security Gate"
+            echo
+            if [ "$BLOCKED" = true ]; then
+              echo "### ❌ Релиз ОСТАНОВЛЕН — найдены уязвимости выше допустимых порогов"
+            else
+              echo "### ✅ Релиз РАЗРЕШЁН — все проверки в пределах порогов"
+            fi
+            echo
+            echo "Коммит \`${GITHUB_SHA::7}\` · [Запуск пайплайна]($RUN_URL) · [GitHub Security]($SEC_URL)"
+            echo
+            echo "| Проверка | Найдено | Порог | Статус |"
+            echo "|---|---:|---:|---|"
+            cat rows.md
+            if [ -n "$FAILED_JOBS" ]; then
+              echo
+              echo "⚠️ Этапы, завершившиеся с ошибкой: \`$FAILED_JOBS\`"
+            fi
+            echo
+            echo "## 🔧 Рекомендации по исправлению"
+          } > report.md
+
+          # Секреты
+          F="$R/gitleaks/gitleaks.sarif"
+          ROWS=""
+          [ -f "$F" ] && ROWS=$(jq -r '.runs[]?.results[]? | "| \(.ruleId) | `\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)` |"' "$F" | head -n 15)
+          if [ -n "$ROWS" ]; then
+            {
+              echo
+              echo "### 🔑 Секреты в коде"
+              echo "Как исправить: отозвать (ротировать) секрет, хранить его в GitHub Secrets или Vault, удалить из истории git (\`git filter-repo\`), подключить pre-commit хук Gitleaks."
+              echo
+              echo "| Правило | Файл:строка |"
+              echo "|---|---|"
+              echo "$ROWS"
+            } >> report.md
+          fi
+
+          # SAST
+          F="$R/semgrep/semgrep.sarif"
+          ROWS=""
+          [ -f "$F" ] && ROWS=$(jq -r '.runs[]?.results[]? | select(.level=="error") | "| `\(.ruleId | split(".") | last)` | `\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)` | \(.message.text | gsub("[\\r\\n|]"; " ") | .[0:160]) |"' "$F" | head -n 15)
+          if [ -n "$ROWS" ]; then
+            {
+              echo
+              echo "### 🧩 Уязвимый код (Semgrep, уровень ERROR)"
+              echo "Как исправить: подробное описание каждого правила — во вкладке Security. Типовые меры: параметризованные запросы вместо склейки SQL, экранирование вывода против XSS, валидация входных данных, отказ от eval()."
+              echo
+              echo "| Правило | Файл:строка | Описание |"
+              echo "|---|---|---|"
+              echo "$ROWS"
+            } >> report.md
+          fi
+
+          # Зависимости и образ
+          DEP_FILES=""
+          for f in "$R/trivy-fs/trivy-fs.json" "$R/trivy-image/trivy-image.json"; do
+            [ -f "$f" ] && DEP_FILES="$DEP_FILES $f"
+          done
+          ROWS=""
+          [ -n "$DEP_FILES" ] && ROWS=$(jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL") | "| \(.PkgName) | \(.InstalledVersion) | \(.FixedVersion // "нет исправления") | [\(.VulnerabilityID)](\(.PrimaryURL // "https://avd.aquasec.com")) |"' $DEP_FILES | sort -u | head -n 20)
+          if [ -n "$ROWS" ]; then
+            {
+              echo
+              echo "### 📦 Уязвимые зависимости и пакеты образа (CRITICAL)"
+              echo "Как исправить: обновить пакет до версии из колонки «Исправлено в» (\`npm install пакет@версия\`) и пересобрать образ. Если исправления нет — заменить библиотеку."
+              echo
+              echo "| Пакет | Установлено | Исправлено в | Уязвимость |"
+              echo "|---|---|---|---|"
+              echo "$ROWS"
+            } >> report.md
+          fi
+
+          # Конфигурация
+          F="$R/config/trivy-config.json"
+          ROWS=""
+          [ -f "$F" ] && ROWS=$(jq -r '.Results[]? | .Target as $t | .Misconfigurations[]? | select(.Severity=="HIGH" or .Severity=="CRITICAL") | "| \(.Severity) | `\($t)` | \(.Title) | \((.Resolution // "") | gsub("[\\r\\n|]"; " ")) |"' "$F" | head -n 15)
+          if [ -n "$ROWS" ]; then
+            {
+              echo
+              echo "### ⚙️ Ошибки конфигурации (Trivy config)"
+              echo
+              echo "| Уровень | Файл | Проблема | Как исправить |"
+              echo "|---|---|---|---|"
+              echo "$ROWS"
+            } >> report.md
+          fi
+
+          # DAST
+          ROWS=""
+          [ -n "$ZAP_FILES" ] && ROWS=$(jq -r -s '[.[] | .site[]?.alerts[]? | select(.riskcode=="3" or .riskcode=="2")] | unique_by(.name) | sort_by(.riskcode) | reverse | .[] | "| \(.riskdesc | split(" ")[0]) | \(.name) | \(.solution | gsub("<[^>]*>"; "") | gsub("[\\r\\n|]"; " ") | .[0:220]) |"' $ZAP_FILES | head -n 20)
+          if [ -n "$ROWS" ]; then
+            {
+              echo
+              echo "### 🌐 Уязвимости работающего приложения (OWASP ZAP, High и Medium)"
+              echo
+              echo "| Риск | Уязвимость | Как исправить |"
+              echo "|---|---|---|"
+              echo "$ROWS"
+            } >> report.md
+          fi
+
+          {
+            echo
+            echo "---"
+            echo "Полные отчёты — в артефактах запуска и во вкладке Security. Пороги задаются переменными \`MAX_*\` в Settings → Secrets and variables → Actions → Variables; повышать их допустимо только после анализа и документирования принятого риска."
+          } >> report.md
+
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          echo "blocked=$BLOCKED" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on Pull Request
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file report.md --edit-last \
+            || gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file report.md
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-report
+          path: report.md
+
+      - name: Block release
+        if: steps.gate.outputs.blocked == 'true'
+        run: |
+          echo "::error::Security Gate: релиз остановлен — превышены пороги уязвимостей. Подробности в отчёте выше."
+          exit 1
+
+  # ─────────────── 9. Деплой на VPS ───────────────
+  deploy:
+    name: "9. Deploy to VPS"
+    needs: [security-gate, build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    environment:
+      name: production
+      url: http://188.225.74.233
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Deploy container
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+        run: |
+          ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" bash -s <<EOF
+          set -e
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          docker pull "$IMAGE"
+          docker logout ghcr.io
+          docker rm -f juice-shop 2>/dev/null || true
+          docker run -d --name juice-shop --restart unless-stopped -p 80:3000 "$IMAGE"
+          docker image prune -af
+          EOF
+
+      - name: Smoke test
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          for i in $(seq 1 36); do
+            if curl -sf "http://$SSH_HOST/" > /dev/null; then
+              echo "✅ Juice Shop доступен на сервере"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Приложение на сервере не ответило за 3 минуты"; exit 1
