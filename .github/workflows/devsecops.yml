@@ -401,7 +401,10 @@ jobs:
           }
 
           SECRETS=$(count '[.[].runs[]?.results[]?] | length' "$R/report-gitleaks/gitleaks.sarif")
-          SAST=$(count '[.[].runs[]?.results[]? | select(.level=="error")] | length' "$R/report-semgrep/semgrep.sarif")
+          # Semgrep записывает уровень (error/warning/note) не в саму находку,
+          # а в описание правила (defaultConfiguration), поэтому берём его оттуда
+          SEMGREP_ERR='.runs[]? | (reduce (.tool.driver.rules[]?) as $r ({}; .[$r.id] = ($r.defaultConfiguration.level // "warning"))) as $lv | .results[]? | select((.level // $lv[.ruleId] // "warning") == "error")'
+          SAST=$(count "[.[] | $SEMGREP_ERR] | length" "$R/report-semgrep/semgrep.sarif")
           SCA=$(count '[.[].Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$R/report-trivy-fs/trivy-fs.json")
           IMG=$(count '[.[].Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$R/report-trivy-image/trivy-image.json")
           MISCONF=$(count '[.[].Results[]?.Misconfigurations[]? | select(.Severity=="HIGH" or .Severity=="CRITICAL")] | length' "$R/report-config/trivy-config.json")
@@ -474,7 +477,7 @@ jobs:
           # SAST
           F="$R/report-semgrep/semgrep.sarif"
           ROWS=""
-          [ -f "$F" ] && ROWS=$(jq -r '.runs[]?.results[]? | select(.level=="error") | "| `\(.ruleId | split(".") | last)` | `\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)` | \(.message.text | gsub("[\\r\\n|]"; " ") | .[0:160]) |"' "$F" | head -n 15)
+          [ -f "$F" ] && ROWS=$(jq -r "$SEMGREP_ERR"' | "| `\(.ruleId | split(".") | last)` | `\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)` | \(.message.text | gsub("[\\r\\n|]"; " ") | .[0:160]) |"' "$F" | head -n 15)
           if [ -n "$ROWS" ]; then
             {
               echo
@@ -569,7 +572,8 @@ jobs:
   deploy:
     name: "9. Deploy to VPS"
     needs: [security-gate, build]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    # Деплой: push в master или ручной запуск (кнопка Run workflow); из PR — никогда
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
       contents: read
